@@ -2,147 +2,125 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from mendeleev import element
+import random
+from tqdm import tqdm
 
-# 1. THE DATASET (Same 10, but we're going for higher accuracy)
-training_data = {
-    "NaOH": (['Na', 'O', 'H'], 5.8),
-    "LiOH": (['Li', 'O', 'H'], 6.0),
-    "KOH": (['K', 'O', 'H'], 5.5),
-    "Mg(OH)2": (['Mg', 'O', 'H', 'H'], 5.0),
-    "Ca(OH)2": (['Ca', 'O', 'H', 'H'], 5.6),
-    "Zn(OH)2": (['Zn', 'O', 'H', 'H'], 3.3),
-    "Ni(OH)2": (['Ni', 'O', 'H', 'H'], 3.7),
-    "Co(OH)2": (['Co', 'O', 'H', 'H'], 3.0),
-    "Cu(OH)2": (['Cu', 'O', 'H', 'H'], 2.6),
-    "Mn(OH)2": (['Mn', 'O', 'H', 'H'], 3.5)
-}
+# --- 1. THE GENERATOR (Internal Data Factory) ---
+def generate_big_dataset_cached(n_entries=500):
+    symbols_to_cache = [
+        'Li', 'Na', 'K', 'Rb', 'Cs', 'Be', 'Mg', 'Ca', 'Sr', 'Ba',
+        'Sc', 'Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Zn',
+        'Y', 'Zr', 'Nb', 'Mo', 'Ag', 'Cd', 'B', 'Al', 'Ga', 'In', 
+        'Sn', 'Pb', 'F', 'O', 'Cl', 'Br', 'S', 'N', 'H'
+    ]
+    print("Caching Periodic Table properties...")
+    cache = {s: element(s) for s in symbols_to_cache}
+    
+    anions = {
+        "F": (['F'], 4.0), "O": (['O'], 3.5), "OH": (['O', 'H'], 3.2),
+        "Cl": (['Cl'], 3.0), "Br": (['Br'], 2.8), "S": (['S'], 2.5)
+    }
+    metals = [s for s in symbols_to_cache if s not in ['F', 'O', 'Cl', 'Br', 'S', 'N', 'H']]
+    
+    data = {}
+    print(f"Generating {n_entries} compounds...")
+    while len(data) < n_entries:
+        m_sym = random.choice(metals)
+        a_name, (a_list, a_chi) = random.choice(list(anions.items()))
+        el_m = cache[m_sym]
+        
+        # Physics Heuristic
+        m_chi = el_m.en_pauling or 1.5
+        gap = max(0.1, (abs(a_chi - m_chi) * 3.2) + (8.0 / el_m.atomic_number) - (0.9 if el_m.block == 'd' else 0.0))
+        
+        name = f"{m_sym}{a_name}_{len(data)}"
+        data[name] = ([m_sym] + a_list, round(gap, 2))
+    return data, cache
 
-def get_compound_tensor(symbols):
+# --- 2. FEATURE ENGINEERING ---
+def get_compound_tensor(symbols, cache):
     # Features: [At_Num, Mass, EN, Radius, Valence, Ion_Energy, D_Electrons]
     global_max = torch.tensor([118.0, 294.0, 3.98, 225.0, 8.0, 25.0, 10.0])
-    
-    raw_matrix = []
-    weights = []
+    raw_matrix, weights = [], []
     
     for s in symbols:
-        el = element(s)
-        # Weighting: Protagonist (Metal) vs Supporting Cast (O, H)
-        weights.append(5.0 if s not in ['O', 'H'] else 1.0)
+        el = cache[s] if s in cache else element(s)
+        # Weight the Metal (Protagonist) higher than the Anions
+        weights.append(5.0 if s not in ['O', 'H', 'F', 'Cl', 'Br', 'S', 'N'] else 1.0)
         
-        # 1. Standard Props
-        row = [
-            float(el.atomic_number),
-            float(el.atomic_weight),
-            float(el.en_pauling or 0.0),
-            float(el.covalent_radius or 0.0)
-        ]
-        
-        # 2. Robust Valence Fetch
+        # 1. Valence (Universal Check)
         valence = 0.0
         for name in ['n_valence', 'nvalence', 'valence_electrons']:
             if hasattr(el, name):
-                v_attr = getattr(el, name)
-                valence = float(v_attr() if callable(v_attr) else v_attr)
+                v = getattr(el, name)
+                valence = float(v() if callable(v) else v)
                 break
-        row.append(valence)
-        
-        # 3. Ionization Energy (The Physics "Cheat Code")
-        ion_e = float(el.ionenergies[1] if el.ionenergies else 0.0)
-        row.append(ion_e)
-        
-        # 4. FIXED: D-Electron Count
-        # Orbital l=2 is the d-orbital. el.ec.conf is [(n, l, occupancy), ...]
-        d_electrons = 0.0
-        try:
-            d_electrons = float(sum(occ for (n, l, occ) in el.ec.conf if l == 2))
-        except:
-            d_electrons = 0.0
-        row.append(d_electrons)
-        
+
+        # 2. D-Electrons (Configuration Check)
+        d_elec = 0.0
+        try: d_elec = float(sum(occ for (n, l, occ) in el.ec.conf if l == 2))
+        except: pass
+
+        # 3. Ionization Energy (Dictionary Check - Key 1 is the first energy)
+        # Using .get(1) avoids the KeyError: 0
+        ion_e = 0.0
+        if el.ionenergies:
+            ion_e = float(el.ionenergies.get(1, 0.0))
+
+        row = [
+            float(el.atomic_number), 
+            float(el.atomic_weight), 
+            float(el.en_pauling or 0.0),
+            float(el.covalent_radius or 0.0), 
+            valence, 
+            ion_e, 
+            d_elec
+        ]
         raw_matrix.append(row)
         
-    tensor = torch.tensor(raw_matrix, dtype=torch.float) / global_max
-    weight_tensor = torch.tensor(weights, dtype=torch.float).view(-1, 1)
-    return tensor, weight_tensor
+    return torch.tensor(raw_matrix, dtype=torch.float) / global_max, torch.tensor(weights, dtype=torch.float).view(-1, 1)
 
-# Pre-cache
-prepared_data = []
-for atoms, gap in training_data.values():
-    feat, w = get_compound_tensor(atoms)
-    prepared_data.append((feat, w, torch.tensor([[gap]])))
-
-# 2. THE BRAIN (With Weighted Pooling)
-class WeightedBandGapModel(nn.Module):
+# --- 3. THE BRAIN ---
+class BandGapModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.network = nn.Sequential(
-            nn.Linear(7, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
+            nn.Linear(7, 64), nn.ReLU(),
+            nn.Linear(64, 32), nn.ReLU(),
             nn.Linear(32, 1)
         )
-        
-    def forward(self, x, weights):
+    def forward(self, x, w):
         latent = self.network(x)
-        # WEIGHTED POOLING: (Latent * Weights).sum() / Weights.sum()
-        weighted_sum = torch.sum(latent * weights, dim=0, keepdim=True)
-        return weighted_sum / torch.sum(weights)
+        return torch.sum(latent * w, dim=0, keepdim=True) / torch.sum(w)
 
-# --- THE DUAL-PATH BRAIN ---
-class CationFocusedModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # Path A: Just the Metal Atom (The Protagonist)
-        self.cation_path = nn.Sequential(
-            nn.Linear(7, 32),
-            nn.ReLU(),
-            nn.Linear(32, 16)
-        )
-        # Path B: The whole compound average (The Background)
-        self.env_path = nn.Sequential(
-            nn.Linear(7, 16),
-            nn.ReLU()
-        )
-        # Final Decision
-        self.readout = nn.Linear(16 + 16, 1)
-        
-    def forward(self, x, weights):
-        # 1. Identify the Metal (The one with weight 5.0)
-        metal_idx = torch.argmax(weights)
-        metal_features = x[metal_idx].unsqueeze(0)
-        
-        # 2. Get Cation Character
-        cation_vibe = self.cation_path(metal_features)
-        
-        # 3. Get Environment Vibe (Mean Pooling)
-        env_vibe = torch.mean(self.env_path(x), dim=0, keepdim=True)
-        
-        # 4. Combine and Predict
-        combined = torch.cat((cation_vibe, env_vibe), dim=1)
-        return self.readout(combined)
+# --- 4. EXECUTION ---
+raw_data, master_cache = generate_big_dataset_cached(500)
+prepared = [(get_compound_tensor(a, master_cache), torch.tensor([[g]])) for a, g in raw_data.values()]
 
-model = CationFocusedModel()
+model = BandGapModel()
 optimizer = optim.Adam(model.parameters(), lr=0.005)
 criterion = nn.MSELoss()
 
-# 3. TRAINING
-print("Training with Weighted Metal-Cation Bias...")
-for epoch in range(2500):
+print("\nTraining on 500 compounds...")
+for epoch in tqdm(range(1501)):
+    random.shuffle(prepared) # Shuffle every epoch to prevent memorization
     total_loss = 0
-    for feat, w, target in prepared_data:
+    for (feat, w), target in prepared:
         optimizer.zero_grad()
-        pred = model(feat, w)
-        loss = criterion(pred, target)
+        loss = criterion(model(feat, w), target)
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
-    if epoch % 500 == 0:
-        print(f"Epoch {epoch} | Loss: {total_loss/len(prepared_data):.5f}")
+    if epoch % 300 == 0:
+        print(f"Epoch {epoch} | Avg Loss: {total_loss/len(prepared):.5f}")
 
-# 4. TEST
-test_hydroxides = {"Al(OH)3": ['Al','O','O','O','H','H','H'], "Fe(OH)3": ['Fe','O','O','O','H','H','H']}
-for name, atoms in test_hydroxides.items():
-    f, w = get_compound_tensor(atoms)
-    with torch.no_grad():
-        print(f"Compound: {name:7} | Predicted Band Gap: {model(f, w).item():.2f} eV")
+# --- 5. THE TEST ---
+test_set = {"Al(OH)3": ['Al','O','O','O','H','H','H'], "Fe(OH)3": ['Fe','O','O','O','H','H','H']}
+print("\n--- Results ---")
+for name, atoms in test_set.items():
+    f, w = get_compound_tensor(atoms, master_cache)
+    print(f"{name:7} | Predicted: {model(f, w).item():.2f} eV")
+
+# Save the weights
+torch.save(model.state_dict(), "hydroxide_brain.pth")
+print("Weights saved. No more waiting!")
