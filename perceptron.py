@@ -2,125 +2,154 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from mendeleev import element
-import random
+import pandas as pd
+import re
 from tqdm import tqdm
+import random
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
 
-# --- 1. THE GENERATOR (Internal Data Factory) ---
-def generate_big_dataset_cached(n_entries=500):
-    symbols_to_cache = [
-        'Li', 'Na', 'K', 'Rb', 'Cs', 'Be', 'Mg', 'Ca', 'Sr', 'Ba',
-        'Sc', 'Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Zn',
-        'Y', 'Zr', 'Nb', 'Mo', 'Ag', 'Cd', 'B', 'Al', 'Ga', 'In', 
-        'Sn', 'Pb', 'F', 'O', 'Cl', 'Br', 'S', 'N', 'H'
-    ]
-    print("Caching Periodic Table properties...")
-    cache = {s: element(s) for s in symbols_to_cache}
-    
-    anions = {
-        "F": (['F'], 4.0), "O": (['O'], 3.5), "OH": (['O', 'H'], 3.2),
-        "Cl": (['Cl'], 3.0), "Br": (['Br'], 2.8), "S": (['S'], 2.5)
-    }
-    metals = [s for s in symbols_to_cache if s not in ['F', 'O', 'Cl', 'Br', 'S', 'N', 'H']]
-    
-    data = {}
-    print(f"Generating {n_entries} compounds...")
-    while len(data) < n_entries:
-        m_sym = random.choice(metals)
-        a_name, (a_list, a_chi) = random.choice(list(anions.items()))
-        el_m = cache[m_sym]
-        
-        # Physics Heuristic
-        m_chi = el_m.en_pauling or 1.5
-        gap = max(0.1, (abs(a_chi - m_chi) * 3.2) + (8.0 / el_m.atomic_number) - (0.9 if el_m.block == 'd' else 0.0))
-        
-        name = f"{m_sym}{a_name}_{len(data)}"
-        data[name] = ([m_sym] + a_list, round(gap, 2))
-    return data, cache
+# --- 1. DATASET CLASSES ---
+class MaterialDataset(Dataset):
+    def __init__(self, prepared_data):
+        self.data = prepared_data
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self, idx):
+        (feat, w), target = self.data[idx]
+        return feat, w, target
 
-# --- 2. FEATURE ENGINEERING ---
+def collate_fn(batch):
+    features, weights, targets = zip(*batch)
+    features_padded = pad_sequence(features, batch_first=True)
+    weights_padded = pad_sequence(weights, batch_first=True)
+    targets_stack = torch.stack(targets)
+    return features_padded, weights_padded, targets_stack
+
+# --- 2. LOGIC FUNCTIONS ---
+def parse_formula(formula):
+    tokens = re.findall(r'([A-Z][a-z]*)(\d*)', str(formula))
+    expanded = []
+    for symbol, count in tokens:
+        count = int(count) if count else 1
+        expanded.extend([symbol] * count)
+    return expanded
+
 def get_compound_tensor(symbols, cache):
-    # Features: [At_Num, Mass, EN, Radius, Valence, Ion_Energy, D_Electrons]
     global_max = torch.tensor([118.0, 294.0, 3.98, 225.0, 8.0, 25.0, 10.0])
     raw_matrix, weights = [], []
-    
     for s in symbols:
-        el = cache[s] if s in cache else element(s)
-        # Weight the Metal (Protagonist) higher than the Anions
+        if s not in cache: cache[s] = element(s)
+        el = cache[s]
         weights.append(5.0 if s not in ['O', 'H', 'F', 'Cl', 'Br', 'S', 'N'] else 1.0)
         
-        # 1. Valence (Universal Check)
         valence = 0.0
         for name in ['n_valence', 'nvalence', 'valence_electrons']:
             if hasattr(el, name):
-                v = getattr(el, name)
-                valence = float(v() if callable(v) else v)
+                v = getattr(el, name); valence = float(v() if callable(v) else v)
                 break
-
-        # 2. D-Electrons (Configuration Check)
+        
         d_elec = 0.0
         try: d_elec = float(sum(occ for (n, l, occ) in el.ec.conf if l == 2))
         except: pass
 
-        # 3. Ionization Energy (Dictionary Check - Key 1 is the first energy)
-        # Using .get(1) avoids the KeyError: 0
-        ion_e = 0.0
-        if el.ionenergies:
-            ion_e = float(el.ionenergies.get(1, 0.0))
+        ion_e = float(el.ionenergies.get(1, 0.0)) if el.ionenergies else 0.0
 
-        row = [
-            float(el.atomic_number), 
-            float(el.atomic_weight), 
-            float(el.en_pauling or 0.0),
-            float(el.covalent_radius or 0.0), 
-            valence, 
-            ion_e, 
-            d_elec
-        ]
+        row = [float(el.atomic_number), float(el.atomic_weight), float(el.en_pauling or 0.0),
+               float(el.covalent_radius or 0.0), valence, ion_e, d_elec]
         raw_matrix.append(row)
-        
     return torch.tensor(raw_matrix, dtype=torch.float) / global_max, torch.tensor(weights, dtype=torch.float).view(-1, 1)
 
-# --- 3. THE BRAIN ---
+# --- 3. THE UPDATED BATCH-READY BRAIN ---
 class BandGapModel(nn.Module):
     def __init__(self):
         super().__init__()
+        # 34k samples allows for much higher dimensionality
         self.network = nn.Sequential(
-            nn.Linear(7, 64), nn.ReLU(),
-            nn.Linear(64, 32), nn.ReLU(),
-            nn.Linear(32, 1)
+            nn.Linear(7, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1), # Prevents memorization
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
         )
     def forward(self, x, w):
         latent = self.network(x)
-        return torch.sum(latent * w, dim=0, keepdim=True) / torch.sum(w)
+        weighted_sum = torch.sum(latent * w, dim=1)
+        total_weight = torch.sum(w, dim=1)
+        return weighted_sum / total_weight
 
-# --- 4. EXECUTION ---
-raw_data, master_cache = generate_big_dataset_cached(500)
-prepared = [(get_compound_tensor(a, master_cache), torch.tensor([[g]])) for a, g in raw_data.values()]
+# --- 4. PREPARATION ---
+def load_and_prepare_csv(file_path):
+    df = pd.read_csv(file_path)
+    print(f"Loaded {len(df)} compounds.")
+    unique_elements = set()
+    for formula in df['formula']:
+        unique_elements.update(re.findall(r'[A-Z][a-z]*', str(formula)))
+    cache = {s: element(s) for s in unique_elements}
+    
+    prepared_list = []
+    print("Pre-processing into tensors...")
+    for _, row in tqdm(df.iterrows(), total=len(df)):
+        atoms = parse_formula(row['formula'])
+        feat, w = get_compound_tensor(atoms, cache)
+        prepared_list.append(((feat, w), torch.tensor([float(row['band_gap'])])))
+    return prepared_list, cache
+
+# --- 5. EXECUTION ---
+csv_path = "real_materials_data.csv" # Ensure this file exists
+prepared, master_cache = load_and_prepare_csv(csv_path)
+
+dataset = MaterialDataset(prepared)
+train_loader = DataLoader(dataset, batch_size=64, shuffle=True, collate_fn=collate_fn)
 
 model = BandGapModel()
-optimizer = optim.Adam(model.parameters(), lr=0.005)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 criterion = nn.MSELoss()
 
-print("\nTraining on 500 compounds...")
-for epoch in tqdm(range(1501)):
-    random.shuffle(prepared) # Shuffle every epoch to prevent memorization
+# Learning Rate Scheduler: Drops LR by half every 30 epochs
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
+
+print(f"Training on {device} with LR Scheduling...")
+for epoch in range(101):
+    model.train()
     total_loss = 0
-    for (feat, w), target in prepared:
+    for feats, weights, targets in tqdm(train_loader, leave=False):
+        feats, weights, targets = feats.to(device), weights.to(device), targets.to(device)
+        
         optimizer.zero_grad()
-        loss = criterion(model(feat, w), target)
+        output = model(feats, weights)
+        
+        # --- CUSTOM WEIGHTED LOSS ---
+        # Give 3x more importance to non-metals (target > 0.1)
+        loss_weights = torch.where(targets > 0.1, 3.0, 1.0)
+        loss = (loss_weights * (output - targets)**2).mean()
+        
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
-    if epoch % 300 == 0:
-        print(f"Epoch {epoch} | Avg Loss: {total_loss/len(prepared):.5f}")
+    
+    scheduler.step() # Tick the scheduler
+    
+    if epoch % 10 == 0:
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch} | Loss: {total_loss/len(train_loader):.5f} | LR: {current_lr}")
 
-# --- 5. THE TEST ---
+# --- 6. VALIDATION ---
+model.eval()
 test_set = {"Al(OH)3": ['Al','O','O','O','H','H','H'], "Fe(OH)3": ['Fe','O','O','O','H','H','H']}
-print("\n--- Results ---")
+print("\n--- Validation Results ---")
 for name, atoms in test_set.items():
     f, w = get_compound_tensor(atoms, master_cache)
-    print(f"{name:7} | Predicted: {model(f, w).item():.2f} eV")
+    # Add batch dimension [1, atoms, features] for the model
+    f, w = f.unsqueeze(0).to(device), w.unsqueeze(0).to(device)
+    with torch.no_grad():
+        pred = model(f, w).item()
+        print(f"{name:7} | Predicted: {pred:.2f} eV")
 
-# Save the weights
-torch.save(model.state_dict(), "hydroxide_brain.pth")
-print("Weights saved. No more waiting!")
+torch.save(model.state_dict(), "real_world_brain.pth")
