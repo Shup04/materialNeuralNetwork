@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,6 +13,65 @@ import pandas as pd
 import re
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
+
+from mp_api.client import MPRester
+
+
+# -----------------------------
+# 0. Get MP Values
+# -----------------------------
+
+
+def load_api_key():
+    api_key = os.getenv("API_KEY")
+    if api_key:
+        return api_key
+
+    env_path = Path(__file__).resolve().with_name(".env")
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() == "API_KEY":
+                value = value.strip().strip("'\"")
+                if value:
+                    return value
+
+    raise RuntimeError("Missing API_KEY. Add it to the repo-root .env file or export API_KEY in your shell.")
+
+
+API_KEY = load_api_key()
+
+test_formulas = ["Al(OH)3", "Fe(OH)3", "Al2O3", "SiO2", "GaAs", "Fe", "Cu"]
+
+def print_mp_reference_values(api_key, test_formulas):
+    print("\n--- Materials Project Reference Values ---")
+
+    with MPRester(api_key) as mpr:
+        for formula in test_formulas:
+            docs = mpr.materials.summary.search(
+                formula=formula,
+                is_stable=True,
+                fields=["material_id", "formula_pretty", "band_gap", "symmetry"]
+            )
+
+            print("\n", formula)
+            if not docs:
+                print("  No stable Materials Project entry found.")
+                continue
+
+            for doc in docs[:10]:
+                crystal_system = doc.symmetry.crystal_system if doc.symmetry else None
+                print(
+                    doc.material_id,
+                    doc.formula_pretty,
+                    "band_gap:",
+                    doc.band_gap,
+                    "crystal:",
+                    crystal_system
+                )
 
 
 # -----------------------------
@@ -282,7 +344,8 @@ class BandGapModel(nn.Module):
             nn.Linear(128, 64),
             nn.ReLU(),
 
-            nn.Linear(64, 1)
+            nn.Linear(64, 1),
+            nn.Softplus()
         )
 
     def forward(self, x):
@@ -391,6 +454,22 @@ def load_and_prepare_csv(file_path):
 # -----------------------------
 
 def main():
+
+    # get test data to verify
+    test_formulas = [
+        "Al(OH)3",
+        "Fe(OH)3",
+        "Al2O3",
+        "SiO2",
+        "GaAs",
+        "Fe",
+        "Cu",
+    ]
+
+    api_key = load_api_key()
+    print_mp_reference_values(api_key, test_formulas)
+
+    # load CSV
     csv_path = "real_materials_data.csv"
 
     # Sanity-check formula parsing
@@ -400,6 +479,20 @@ def main():
         print(f, comp.get_el_amt_dict())
 
     features, targets, master_cache = load_and_prepare_csv(csv_path)
+
+    df = pd.read_csv("real_materials_data.csv")
+
+    dupes = (
+        df.groupby("formula")["band_gap"]
+        .agg(["count", "min", "max", "mean", "std"])
+        .sort_values("count", ascending=False)
+    )
+
+    print(dupes.head(30))
+
+    wild = dupes[(dupes["count"] > 1) & ((dupes["max"] - dupes["min"]) > 1.0)]
+    print("\nFormulas with same formula but band gaps differing by more than 1 eV:")
+    print(wild.head(30))
 
     # Train/validation split
     x_train, x_val, y_train, y_val = train_test_split(

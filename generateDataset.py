@@ -1,8 +1,31 @@
+import os
+from pathlib import Path
+
 from mp_api.client import MPRester
 import pandas as pd
 
-# Replace with your actual API key from the MP dashboard
-API_KEY = "key here"
+
+def load_api_key():
+    api_key = os.getenv("API_KEY")
+    if api_key:
+        return api_key
+
+    env_path = Path(__file__).resolve().with_name(".env")
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() == "API_KEY":
+                value = value.strip().strip("'\"")
+                if value:
+                    return value
+
+    raise RuntimeError("Missing API_KEY. Add it to the repo-root .env file or export API_KEY in your shell.")
+
+
+API_KEY = load_api_key()
 
 with MPRester(API_KEY) as mpr:
     # Query for stable materials with a calculated band gap
