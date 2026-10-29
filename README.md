@@ -1,71 +1,217 @@
-# Project Blueprint: AI-Driven Discovery of High-Temperature Superconductors
+# materialNeuralNetwork
 
-**Objective:** Bypass the combinatorial explosion of materials science using Geometric Deep Learning to discover a room-temperature, net-positive superconducting material. 
+A materials-learning experiment that asks whether a chemical formula, represented
+through the properties and proportions of its elements, contains enough information
+to predict a useful electronic property. The implemented model predicts **band gap
+in electronvolts (eV)** from composition. The original motivation was much more
+ambitious: learning from crystal structures to explore superconducting materials.
 
----
+The repository captures the steps between those ideas: small atom-level networks,
+predictions collapsing toward the mean, a larger Materials Project dataset, and a
+replacement model that learns from whole-composition features. It contains the
+training scripts, downloaded data and saved weights. It does not yet implement a
+crystal graph network or predict superconducting critical temperature.
 
-## Phase 1: The Physics Target (What We Are Looking For)
-We are not looking for a pure metal. We are looking for a **Chemical-Pressure Doped Hydride Ceramic**. The goal is to create a specific atomic traffic jam that forces electrons to form Cooper Pairs at room temperature without the need for mechanical presses or cryogenic cooling.
+## The original idea
 
-*   **The Cage (Mott Insulator):** A rigid, perfect crystal lattice (ceramic) made of heavy transition metals and highly electronegative elements (like Oxygen). The baseline material should be a perfect insulator where electrons are gridlocked.
-*   **The Vibrator (Interstitials):** Lightweight atoms (Hydrogen) packed into the empty spaces of the cage. They vibrate at extremely high frequencies to facilitate the quantum pairing of electrons.
-*   **The Flaws (Substitutional Doping):** Replacing a specific percentage of atoms in the cage with elements that have fewer valence electrons. This creates "holes" in the gridlock, forcing the electrons to violently interact with the high-frequency vibrations as they move, creating zero-friction Cooper Pairs.
+The initial blueprint proposed searching a large space of possible materials using
+continuous physical features rather than treating element names as unrelated IDs.
+The hoped-for benefit was to learn relationships between chemistry, atomic
+arrangement and a target property instead of manually trying every composition.
 
----
+Its particular materials hypothesis was a **chemical-pressure, doped hydride
+ceramic**: a rigid transition-metal/electronegative lattice, lightweight hydrogen
+interstitials and substitutional doping. The blueprint associated those ingredients
+with confinement, vibrations and altered electronic behavior, with room-temperature
+superconductivity as the eventual ambition. These are the project's motivating
+hypotheses, not findings established by this repository. Neither the dataset nor the
+current model tests that proposed mechanism.
 
-## Phase 2: The Data Architecture (How We Code It)
-Language models (LLMs) and 1D tokenizers fail at 3D physics. We will represent crystals strictly as **Graphs** to preserve spatial geometry and topological tension.
+The proposed representation was spatial: atoms as feature-bearing nodes, neighbors
+and distances as edges, and larger supercells with vacancies, interstitials or
+substitutions. Three or four message-passing steps would update each atom from its
+neighbors, followed by global pooling and a readout predicting critical temperature
+(`Tc`). The planned first inputs were crystal structures such as CIF files paired
+with appropriate target measurements.
 
-### 1. The Nodes (The Atoms)
-Atoms are not discrete IDs. They are represented by a **Continuous Feature Vector** (1D Array) containing immutable physical properties. 
-*   *Example array parameters:* Atomic Number, Atomic Radius, Electronegativity, Valence Electrons, Outer Orbital Shape Type.
-*   Because these are floating-point numbers, the AI can mathematically "stress" them during training without needing a massive dictionary of states.
+That graph pipeline remains a future research direction. The working code instead
+tackles a narrower question using a readily available band-gap dataset. Band-gap
+prediction does not, by itself, demonstrate superconductivity discovery.
 
-### 2. The Edges (The Architecture)
-The 3D structure (e.g., flat sheets vs. rigid pyramids) is defined entirely by the **Edge Index**. This is a secondary matrix that tells the AI exactly which nodes are bonded together and the physical distance (in angstroms) between them.
+## How the experiment evolved
 
-### 3. The Supercell (Scaling & Defects)
-To simulate reality, a base unit cell is procedurally copied into a massive graph (e.g., 10,000 nodes). A randomization function injects physical flaws:
-*   **Vacancy Defects:** Deleting a node and severing its edges.
-*   **Interstitial Defects:** Injecting a new node into empty space and drawing new edges.
-*   **Substitutional Defects:** Swapping a node's physical array with a different element's array.
+The Git history records several concrete changes in approach:
 
----
+- Early versions built physical-property arrays for atoms and inspected the
+  network's intermediate representation. Small training sets produced inaccurate
+  predictions, including outputs clustered around the mean.
+- The dataset grew from a handful of examples to a downloaded materials table.
+  An intermediate model applied the same network to each atom, then averaged its
+  scalar predictions using hand-selected element weights.
+- The current [`composition_to_features`](perceptron.py#L188) explicitly replaces
+  that independent-atom averaging with one vector describing the whole formula.
+  It combines property means with differences, variation, element fractions and
+  stoichiometry, so the network can learn interactions among those summaries.
+- Formula parsing moved to `pymatgen.Composition`, including grouped formulas such
+  as `Al(OH)3`. Training gained a validation split, train-only standardization,
+  baseline comparisons and best-checkpoint saving.
 
-## Phase 3: The AI Architecture (Graph Neural Network)
-The system uses **Weight Sharing**. Instead of one massive network, a single, highly optimized "physics engine" is applied in parallel to every atom in the graph. 
+The final commit is titled “predicting band gaps works.” That records the author's
+stopping point; the repository does not include a reproducible held-out result that
+establishes how accurate or generalizable the saved model is.
 
-### Step 1: Message Passing (The Hidden Layers)
-The network runs for exactly 3 to 4 "Hops" to prevent oversmoothing. 
-1.  **Gather:** A target atom reads the arrays of its directly connected neighbors.
-2.  **Multiply:** Those neighbor arrays are multiplied by the AI's learned Weight Matrix (the physics filters).
-3.  **Aggregate:** The filtered arrays are summed/averaged together.
-4.  **Update:** The target atom's array is updated with this new data. It now mathematically represents its local physical stress.
+## What is in the repository
 
-### Step 2: Global Pooling & Readout
-1.  After 4 hops, all 10,000 updated node arrays are mathematically pooled into one single master 1D array representing the total lattice tension.
-2.  This master array is fed into a standard Multi-Layer Perceptron (the Readout Head).
-3.  The Readout Head outputs a single predicted float: **Critical Temperature ($T_c$)**.
+| File | Role |
+| --- | --- |
+| [`generateDataset.py`](generateDataset.py) | Queries Materials Project for stable materials and writes formulas, calculated band gaps and element lists. |
+| [`real_materials_data.csv`](real_materials_data.csv) | Committed dataset: 33,973 rows and 33,822 distinct formula strings. |
+| [`perceptron.py`](perceptron.py) | Formula parsing, feature construction, normalization, MLP training, evaluation and manual formula predictions. |
+| `best_bandgap_model.pth` | Checkpoint format written by the current trainer: model weights, input dimension and scaler mean/standard deviation. |
+| `real_world_brain.pth` | Legacy weights from the earlier atom-level model; the current trainer does not load them. |
 
-### Step 3: Backpropagation
-The error between the predicted $T_c$ and the actual $T_c$ is calculated. The algorithm flows backward through the graph pointers to tune the Weight Matrices inside the Message Passing functions. The AI learns the rules of quantum chemistry by optimizing how atoms "listen" to their neighbors.
+There is no inference-only command, dependency lock or automated test suite in this
+snapshot. The two weight files belong to different model designs and should not be
+treated as interchangeable.
 
----
+## The implemented data flow
 
-## The Action Plan (Day 1 Tasks)
+```text
+Materials Project stable-material summaries
+    -> formula + calculated band_gap + elements CSV
+    -> formula parsing and 29 composition features
+    -> 80/20 row split
+    -> standardization fitted on training rows only
+    -> PyTorch MLP
+    -> validation metrics and best checkpoint
+```
 
-**Task 1: Set Up the Environment**
-*   Boot up your Linux environment. 
-*   Create a clean Python virtual environment.
-*   Install `PyTorch` and `PyTorch Geometric` (PyG). PyG is the industry standard library for building Message Passing neural networks.
+### Data collection
 
-**Task 2: API Keys & Data Acquisition**
-*   Register for an API key at **The Materials Project** (`materialsproject.org`). This is the open-source database containing hundreds of thousands of computed materials and known superconductors.
-*   Write a Python script to hit their API. Your goal is to download a dataset of known superconductors containing two things:
-    1.  The `.cif` (Crystallographic Information File) which contains the 3D coordinates of the atoms.
-    2.  The experimental Critical Temperature ($T_c$) target value.
+[`generateDataset.py`](generateDataset.py#L30) requests entries with
+`is_stable=True`, selecting `formula_pretty`, `band_gap` and `elements`. It writes
+`real_materials_data.csv` in the current directory. It does not download crystal
+coordinates, bonds, CIF files, superconducting temperatures or material IDs.
 
-**Task 3: The Graph Converter**
-*   Write a parser function. It needs to read a `.cif` file and output two PyTorch Tensors:
-    1.  The `Node Matrix` (mapping the elements in the file to your hardcoded physical property arrays).
-    2.  The `Edge Index` (calculating which atoms are close enough to be bonded and formatting them into a source/target pointer list).
+The trainer reads the formula and band-gap columns, removes missing/non-numeric
+targets and skips formulas that fail feature construction. The CSV's element-list
+column is not used by the current model; the formula is parsed again instead.
+
+### Why these 29 features?
+
+[`get_element_data`](perceptron.py#L119) caches properties from `mendeleev`.
+`composition_to_features` weights them by the atom counts parsed from each formula.
+
+| Group | Features | What the representation retains |
+| --- | --- | --- |
+| Weighted means (7) | Atomic number, atomic weight, electronegativity, covalent radius, first ionization energy, valence electrons, d-electron count | The average elemental character of the formula. |
+| Ranges (4) | Electronegativity, atomic number, covalent radius, ionization energy | Differences between constituent elements that an average alone would hide. |
+| Weighted variances (3) | Electronegativity, atomic number, covalent radius | How unevenly those properties are distributed. |
+| Category fractions (4) | Metal, nonmetal, halogen, common-anion categories | The proportions assigned by the code's explicit element sets. |
+| Specific fractions (7) | O, H, N, S, C, F, Cl | Direct composition signals for selected elements. |
+| Stoichiometry (4) | Unique-element count, total atom count, largest and smallest element fraction | Basic size and balance of the formula. |
+
+These are hand-designed summaries, not a structural description. Missing element
+properties generally fall back to zero. The metal/nonmetal and related categories
+are the script's heuristic sets, not a learned chemistry classification.
+
+The design trades crystal geometry for a small fixed-size input: formulas of
+different lengths can enter the same ordinary feed-forward model. The cost is that
+different structures sharing the same formula receive the same representation.
+
+### Model and training
+
+[`BandGapModel`](perceptron.py#L329) has widths `29 -> 256 -> 128 -> 64 -> 1`.
+Hidden layers use ReLU, with batch normalization and 10% dropout in the first two
+blocks. A final Softplus constrains the predicted value to be positive.
+
+The trainer uses an 80/20 random row split with `random_state=42`, fits its custom
+scaler only on training features, and runs 150 epochs. It uses AdamW, mean squared
+error, gradient clipping and a learning-rate reduction when validation RMSE stops
+improving. CUDA is selected if available; otherwise it uses the CPU.
+
+The script prints RMSE and MAE in eV and compares against constant-mean baselines.
+It also fetches Materials Project reference entries and prints predictions for
+`Al(OH)3`, `Fe(OH)3`, `Al2O3`, `SiO2`, `GaAs`, `Fe` and `Cu`. Those examples are
+sanity checks, not an independent benchmark or evidence of novel-material discovery.
+
+## How to run this snapshot
+
+Use a separate Python environment. The project does not record compatible package
+versions; the following dependency list comes from the imports, not a verified lock.
+The existing `.gitignore` only ignores `.env`, so this example keeps the environment
+outside the repository:
+
+```sh
+python3 -m venv ../material-neural-network-env
+source ../material-neural-network-env/bin/activate
+python -m pip install torch mendeleev pymatgen pandas tqdm scikit-learn mp-api
+```
+
+Supply a Materials Project credential as the `API_KEY` environment variable or in a
+local repository-root `.env` file. The loader checks the environment first. Keep the
+credential local rather than adding it to a tracked file.
+
+From the repository root:
+
+```sh
+# Train using the checked-in CSV; may overwrite best_bandgap_model.pth.
+python perceptron.py
+
+# Optional dataset refresh; queries Materials Project and replaces the CSV.
+python generateDataset.py
+```
+
+The trainer **still needs API access when using the existing CSV**: it loads the key
+at module import and fetches reference values before training. It does not resume
+the saved checkpoint; it initializes a new model. Preserve the current dataset and
+weights before replacing either. These commands were not run to write this README,
+and compatibility with a newly installed environment remains unverified.
+
+## What the current results can and cannot establish
+
+**Composition is not structure.** The committed CSV contains 151 repeated-formula
+groups; ten have band gaps spanning more than 1 eV. Identical formula inputs cannot
+distinguish those targets. The script already prints duplicate-formula diagnostics.
+This is a limit of the chosen input representation, not something more training
+epochs can resolve.
+
+**The validation split is by row.** Repeated compositions can appear on both sides
+of that split, so it does not establish performance on unseen compositions. No
+specific amount of metric inflation is claimed here. Also, the printed validation
+mean baseline is calculated from validation targets themselves; a predictive
+constant baseline for a held-out evaluation should be fitted on training targets.
+
+**The saved and reported models can differ.** The loop saves weights whenever
+validation RMSE improves, but final metrics and manual predictions use the last
+epoch's in-memory model without reloading that checkpoint. The filename alone does
+not identify which model produced the printed final results.
+
+**The run is not fully reproducible yet.** The split seed is fixed, but model
+initialization and training randomness are not. Package versions, the acquisition
+date/query snapshot and a complete evaluation record are not captured alongside the
+checkpoint. The saved weights were not loaded or scientifically validated during
+this documentation pass.
+
+## Definition of done
+
+The composition-to-band-gap experiment can be finished on its own terms. It does
+not need to become the original superconductivity discovery system to count as a
+completed project.
+
+- [ ] **Make one run reproducible.** Record the working environment, dataset
+  identity/provenance, feature order, random seeds and split membership. A fresh
+  environment should reproduce the documented training/evaluation procedure.
+- [ ] **Evaluate generalization honestly.** Hold out whole canonical compositions,
+  keep that final evaluation separate from checkpoint selection, and compare the
+  selected model with a training-mean baseline using RMSE/MAE. Report how duplicate
+  formulas and conflicting targets were handled.
+- [ ] **Make the checkpoint the deliverable.** Reload the selected weights and
+  scaler for reported results, and provide a prediction path that uses them without
+  retraining or fetching unrelated reference data. Verify that reloaded predictions
+  match the values recorded for that checkpoint.
+- [ ] **Write the experiment's conclusion.** Preserve the evaluation results and a
+  few representative successes/failures. State whether composition-only features
+  added useful predictive information over the baseline, and record the limits.
+  An honest negative result also completes the experiment; crystal graphs and
+  superconducting targets can remain a separately scoped future project.
